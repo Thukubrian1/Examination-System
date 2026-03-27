@@ -53,21 +53,28 @@ if (!$existingResult && $nowTs > $testEndTime) {
     exit;
 }
 
-// ---- Create result record if new attempt ----
-if (!$existingResult) {
-    $stmt = $db->prepare("
-        INSERT INTO results (student_id, test_id, total_marks, started_at, status)
-        VALUES (?, ?, ?, NOW(), 'in_progress')
-    ");
-    $stmt->bind_param('iii', $studentId, $testId, $test['total_marks']);
-    $stmt->execute();
-    $resultId  = $db->insert_id;
-    $stmt->close();
-    $startedAt = time();
-} else {
-    $resultId  = $existingResult['id'];
-    $startedAt = strtotime($existingResult['started_at']);
-}
+// ---- Create or resume result record ----------------------------------------
+// Use INSERT IGNORE so that if a duplicate row already exists (same student+test),
+// we simply do nothing and then re-fetch the existing row.
+// This makes the page fully idempotent on refresh — no duplicate records.
+$stmt = $db->prepare("
+    INSERT IGNORE INTO results (student_id, test_id, total_marks, started_at, status)
+    VALUES (?, ?, ?, NOW(), 'in_progress')
+");
+$stmt->bind_param('iii', $studentId, $testId, $test['total_marks']);
+$stmt->execute();
+$stmt->close();
+
+// Always re-fetch from DB so started_at is the authoritative DB value,
+// not time() which shifts on every page load.
+$stmt = $db->prepare("SELECT * FROM results WHERE student_id = ? AND test_id = ? LIMIT 1");
+$stmt->bind_param('ii', $studentId, $testId);
+$stmt->execute();
+$resultRow = $stmt->get_result()->fetch_assoc();
+$stmt->close();
+
+$resultId  = (int) $resultRow['id'];
+$startedAt = strtotime($resultRow['started_at']);  // fixed DB timestamp, never changes
 
 // ---- Calculate remaining time ----
 // $testEndTime and $nowTs already declared above.
@@ -81,7 +88,7 @@ $remaining           = min($remainingByDuration, $remainingByWindow); // the tig
 $jsEndTime           = $testEndTime;  // passed to JS
 
 // ---- Auto-submit server-side if time has already elapsed ----
-if ($remaining <= 0 && $existingResult && $existingResult['status'] === 'in_progress') {
+if ($remaining <= 0 && $resultRow && $resultRow['status'] === 'in_progress') {
     // Tally whatever answers were saved
     $stmt = $db->prepare("SELECT SUM(marks_awarded) FROM student_answers WHERE result_id = ?");
     $stmt->bind_param('i', $resultId);
@@ -315,7 +322,7 @@ include __DIR__ . '/../includes/header.php';
 //   serverNow  — Unix timestamp when PHP generated the page
 // We use serverNow vs Date.now() to correct for client/server clock skew.
 
-let remaining      = <?= $remaining ?>;
+// remaining is now computed dynamically every tick from startedAtServer + durationSecs
 const jsEndTime    = <?= $jsEndTime ?>;         // absolute close time (Unix seconds)
 const serverNow    = <?= time() ?>;
 const clientNow    = Math.floor(Date.now() / 1000);
@@ -353,16 +360,22 @@ const timerDisplay = document.getElementById('timerDisplay');
 const timerBox     = document.getElementById('timerBox');
 const timerNote    = document.getElementById('timerNote');
 
+// startedAtServer: the Unix timestamp (server time) when the student started.
+// Derived from PHP's $startedAt so it never shifts on refresh.
+const startedAtServer = <?= $startedAt ?>;
+const durationSecs    = <?= $test['duration_minutes'] * 60 ?>;
+
 function tick() {
     if (submitting) return;
 
-    // Recompute remaining every tick against both constraints,
-    // not just counting down — guards against tab sleeping/drift.
-    const now                = serverTime();
-    const windowSecsLeft     = Math.max(0, jsEndTime - now);
-    // remaining tracks duration countdown; sync it to wall clock each tick
-    if (remaining > 0) remaining--;
-    const effectiveRemaining = Math.min(remaining, windowSecsLeft);
+    const now = serverTime();
+
+    // Re-derive both constraints from authoritative values every tick.
+    // This means the timer is always correct even after tab sleep or refresh.
+    const elapsed         = now - startedAtServer;
+    const byDuration      = Math.max(0, durationSecs - elapsed);  // personal timer
+    const byWindow        = Math.max(0, jsEndTime - now);          // wall-clock deadline
+    const effectiveRemaining = Math.min(byDuration, byWindow);     // tighter of the two
 
     if (effectiveRemaining <= 0) {
         timerDisplay.textContent = '00:00';
@@ -373,8 +386,8 @@ function tick() {
 
     timerDisplay.textContent = formatTime(effectiveRemaining);
 
-    // Show a note when the window is the binding constraint
-    if (windowSecsLeft < remaining) {
+    // Show a note when the window deadline is the binding constraint
+    if (byWindow < byDuration) {
         timerNote.textContent = 'Test closes at ' +
             new Date(jsEndTime * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
     } else {
